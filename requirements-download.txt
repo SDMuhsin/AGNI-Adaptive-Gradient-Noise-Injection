@@ -1,0 +1,16 @@
+nltk
+nlpaug
+numpy
+pandas
+urllib3
+tabulate
+scipy<=1.10.1
+dill
+accelerate
+scikit-learn
+gensim
+datasets
+evaluate
+transformers
+boto3
+spacy

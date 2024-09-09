@@ -1,0 +1,10 @@
+downloads/*
+saves/*
+double_env/*
+double_env*/*
+**.tar.gz
+env
+trash
+**.pyc
+sbatch
+*.out
