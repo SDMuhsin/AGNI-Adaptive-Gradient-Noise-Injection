@@ -244,6 +244,27 @@ def compute_with_retry(metric, max_retries=10, initial_wait=1):
                 raise  # Re-raise if it's a different ValueError
     
     raise Exception(f"Failed to compute metric after {max_retries} attempts")
+from collections import defaultdict
+
+class TimingStats:
+    def __init__(self):
+        self.timings = defaultdict(float)
+        self.counts = defaultdict(int)
+
+    def start(self, operation):
+        return time.time()
+
+    def end(self, operation, start_time):
+        duration = time.time() - start_time
+        self.timings[operation] += duration
+        self.counts[operation] += 1
+
+    def report(self):
+        print("Timing Report:")
+        for operation, total_time in self.timings.items():
+            count = self.counts[operation]
+            avg_time = total_time / count if count > 0 else 0
+            print(f"{operation}: Total={total_time:.6f}s, Count={count}, Avg={avg_time:.6f}s")
 
 def main():
 
@@ -589,6 +610,25 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
     eval_result = None
+
+    def compute_variance_online_gpu(gradients):
+        n = 0
+        mean = None
+        M2 = None
+
+        for grad in gradients:
+            if mean is None:
+                mean = torch.zeros_like(grad)
+                M2 = torch.zeros_like(grad)
+
+            n += 1
+            delta = grad - mean
+            mean += delta / n
+            delta2 = grad - mean
+            M2 += delta * delta2
+
+        variance = M2 / (n - 1) if n > 1 else M2
+        return variance
     def compute_variance_online(gradients):
         n = 0
         mean = None
@@ -619,6 +659,9 @@ def main():
 
     tracker = {'time_per_epoch':0,'time_per_batch':0}
     step_sizes = []
+    
+    timing_stats = TimingStats()
+
     for epoch in range(starting_epoch, args.num_train_epochs):
 
         epoch_time_st = time.time()
@@ -633,18 +676,28 @@ def main():
         for step, batch in enumerate(active_dataloader):
 
             batch_time_st = time.time()
-
+            
+            forward_start = timing_stats.start("forward_pass")
             outputs = model(**batch)
+            timing_stats.end("forward_pass", forward_start)
+
+            loss_start = timing_stats.start("loss_computation")
             loss = outputs.loss
             if args.with_tracking:
                 total_loss += loss.detach().float()
             loss = loss / args.gradient_accumulation_steps
+            timing_stats.end("loss_computation", loss_start)
+
+            backward_start = timing_stats.start("backward_pass")
             accelerator.backward(loss)
+            timing_stats.end("backward_pass", backward_start)
 
             # Collect gradients for each parameter separately
+            grad_collection_start = timing_stats.start("gradient_collection")
             for p in model.parameters():
                 if p.grad is not None:
                     gradient_dict[p].append(p.grad.view(-1).detach())
+            timing_stats.end("gradient_collection", grad_collection_start)
 
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 
@@ -652,10 +705,11 @@ def main():
                 param_count = 0
 
                 # Compute the gradient variance and inject noise for each parameter separately
+                variance_noise_start = timing_stats.start("variance_and_noise")
                 for p in model.parameters():
                     if p.grad is not None:
                         if len(gradient_dict[p]) >= args.gradient_accumulation_steps:
-                            gradient_variance = compute_variance_online(gradient_dict[p])
+                            gradient_variance = compute_variance_online_gpu(gradient_dict[p])
                             gradient_dict[p] = []
 
                             # Compute gradient magnitude
@@ -665,20 +719,24 @@ def main():
                             noise_scale = torch.sqrt(eta * gradient_variance.view(p.grad.shape)) * grad_magnitude
                             noise = torch.randn_like(p.grad) * noise_scale
                             
-                            # Compute effective step size (gradient + noise)
-                            effective_grad = p.grad + noise
-                            step_size = torch.norm(effective_grad) * optimizer.param_groups[0]['lr']
+                            # [Commented] Compute effective step size (gradient + noise)
+                            #effective_grad = p.grad + noise
+                            step_size = 0 #torch.norm(effective_grad) * optimizer.param_groups[0]['lr']
 
                             # Inject noise
                             p.grad += noise
                             
-                            total_step_size += step_size
+                            #total_step_size += step_size
                             param_count += 1
+                timing_stats.end("variance_and_noise", variance_noise_start)
+
                 if param_count > 0:
                     avg_step_size = total_step_size / param_count
                     step_sizes.append(avg_step_size)
-
+                optimizer_start = timing_stats.start("optimizer_step")
                 optimizer.step()
+                timing_stats.end("optimizer_step", optimizer_start)
+
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 progress_bar.update(1)
@@ -695,12 +753,13 @@ def main():
                 break
             tracker['time_per_batch'] += time.time() - batch_time_st
             batch_counter += 1       
-        
+        # [Commented] 
+        '''
         if len(step_sizes) > 0:
             avg_step_size, step_size_variance = compute_step_size_stats(step_sizes)
             print(f"Epoch {epoch + 1}")
             print(f"Average step size: {avg_step_size:.6f}")
-            print(f"Step size variance: {step_size_variance:.6f}")
+            print(f"Step size variance: {step_size_variance:.6f}")'''
         step_sizes = []
 
         tracker['time_per_epoch'] += time.time() - epoch_time_st
@@ -761,7 +820,7 @@ def main():
             if args.output_dir is not None:
                 output_dir = os.path.join(args.output_dir, output_dir)
             accelerator.save_state(output_dir)
-    
+    timing_stats.report() 
     tracker['time_per_batch'] /= batch_counter
     tracker['time_per_epoch'] /= epoch_counter
 
